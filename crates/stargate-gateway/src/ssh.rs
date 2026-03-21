@@ -96,10 +96,7 @@ impl server::Handler for SshConnection {
         let Some(route) = route else {
             return Ok(Auth::reject());
         };
-        let Some(expected_public_key) = route.native_client_public_key()? else {
-            return Ok(Auth::reject());
-        };
-        if expected_public_key != *public_key {
+        if !route.allows_client_public_key(public_key)? {
             return Ok(Auth::reject());
         }
         self.route = Some(route);
@@ -118,10 +115,7 @@ impl server::Handler for SshConnection {
                 None => return Ok(Auth::reject()),
             },
         };
-        let Some(expected_public_key) = route.native_client_public_key()? else {
-            return Ok(Auth::reject());
-        };
-        if expected_public_key != *public_key {
+        if !route.allows_client_public_key(public_key)? {
             return Ok(Auth::reject());
         }
         self.route = Some(route);

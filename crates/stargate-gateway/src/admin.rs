@@ -5,8 +5,8 @@ use axum::{
 };
 use serde_json::json;
 use stargate_core::{
-    IssueTerminalSessionRequest, IssueTerminalSessionResponse, NativeTerminalSession,
-    RegisteredRoute, StargateError, TerminalSessionMode,
+    IssueTerminalSessionRequest, IssueTerminalSessionResponse, NativeTerminalAuthMode,
+    NativeTerminalSession, RegisteredRoute, StargateError, TerminalSessionMode,
 };
 use tokio::process::Command;
 
@@ -40,18 +40,19 @@ pub async fn issue_terminal_session(
             }
         }
         TerminalSessionMode::Native => {
-            let (public_key, private_key) = generate_native_client_keypair()?;
-            route.native_client_public_key_openssh = Some(public_key);
+            let native_auth = if route.authorized_client_public_keys_openssh.is_empty() {
+                let (public_key, private_key) = generate_native_client_keypair()?;
+                route.authorized_client_public_keys_openssh = vec![public_key];
+                NativeAuthSession::IssuedKey { private_key }
+            } else {
+                NativeAuthSession::ProfileKeys
+            };
             let stored = state.store.upsert_route(route).await?;
             IssueTerminalSessionResponse {
                 route_username: stored.route_username.clone(),
                 expires_at: stored.expires_at,
                 browser: None,
-                native: Some(build_native_session(
-                    &state,
-                    &stored.route_username,
-                    private_key,
-                )),
+                native: Some(build_native_session(&state, &stored, native_auth)),
             }
         }
     };
@@ -85,8 +86,8 @@ async fn finalize_route(
 
 fn build_native_session(
     state: &GatewayState,
-    route_username: &str,
-    private_key_openssh: String,
+    route: &stargate_core::RouteRecord,
+    native_auth: NativeAuthSession,
 ) -> NativeTerminalSession {
     let ssh_host = state.public_web.public_ssh_host.to_string();
     let ssh_port = state.public_web.public_ssh_port;
@@ -96,15 +97,23 @@ fn build_native_session(
         format!("[{ssh_host}]:{ssh_port}")
     };
     let command = if ssh_port == 22 {
-        format!("ssh {route_username}@{ssh_host}")
+        format!("ssh {}@{ssh_host}", route.route_username)
     } else {
-        format!("ssh -p {ssh_port} {route_username}@{ssh_host}")
+        format!("ssh -p {ssh_port} {}@{ssh_host}", route.route_username)
+    };
+    let (auth_mode, private_key_openssh) = match native_auth {
+        NativeAuthSession::ProfileKeys => (NativeTerminalAuthMode::ProfileKeys, None),
+        NativeAuthSession::IssuedKey { private_key } => {
+            (NativeTerminalAuthMode::IssuedKey, Some(private_key))
+        }
     };
 
     NativeTerminalSession {
+        auth_mode,
+        authorized_key_count: route.authorized_client_public_keys_openssh.len(),
         ssh_host,
         ssh_port,
-        username: route_username.to_owned(),
+        username: route.route_username.clone(),
         private_key_openssh,
         public_host_key_openssh: state.public_web.public_ssh_host_key_openssh.to_string(),
         public_host_key_fingerprint_sha256: state
@@ -117,6 +126,11 @@ fn build_native_session(
         ),
         command,
     }
+}
+
+enum NativeAuthSession {
+    ProfileKeys,
+    IssuedKey { private_key: String },
 }
 
 fn generate_native_client_keypair() -> std::result::Result<(String, String), GatewayHttpError> {

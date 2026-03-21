@@ -9,6 +9,6 @@ pub use config::{
 pub use error::{Result, StargateError};
 pub use model::{
     BrowserTerminalSession, IssueTerminalSessionRequest, IssueTerminalSessionResponse,
-    NativeTerminalSession, RegisteredRoute, RouteMetadata, RouteRecord, SessionKind,
-    TerminalSessionMode, validate_route_username, validate_target_username,
+    NativeTerminalAuthMode, NativeTerminalSession, RegisteredRoute, RouteMetadata, RouteRecord,
+    SessionKind, TerminalSessionMode, validate_route_username, validate_target_username,
 };

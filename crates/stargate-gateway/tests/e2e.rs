@@ -15,8 +15,8 @@ use russh::{
 };
 use serde::Serialize;
 use stargate_core::{
-    AdminAuthSettings, IssueTerminalSessionRequest, IssueTerminalSessionResponse, RouteMetadata,
-    TerminalSessionMode, TerminalTokenSettings, WebSettings,
+    AdminAuthSettings, IssueTerminalSessionRequest, IssueTerminalSessionResponse,
+    NativeTerminalAuthMode, RouteMetadata, TerminalSessionMode, TerminalTokenSettings, WebSettings,
 };
 use stargate_gateway::{
     GatewayState, build_admin_router, build_public_router, run_public_ssh_server,
@@ -33,12 +33,13 @@ use tokio_tungstenite::{
 #[tokio::test]
 async fn issue_native_terminal_session_happy_path() -> Result<()> {
     let harness = Harness::start().await?;
-    let session = harness
-        .issue_terminal_session(TerminalSessionMode::Native)
-        .await?;
+    let session = harness.issue_native_terminal_session(true).await?;
     let native = session.native.context("missing native session bundle")?;
 
     assert_eq!(native.username, harness.route_username);
+    assert_eq!(native.auth_mode, NativeTerminalAuthMode::ProfileKeys);
+    assert_eq!(native.authorized_key_count, 1);
+    assert!(native.private_key_openssh.is_none());
     assert_eq!(native.ssh_host, "127.0.0.1");
     assert_eq!(native.ssh_port, harness.public_ssh_addr.port());
     assert_eq!(
@@ -50,9 +51,30 @@ async fn issue_native_terminal_session_happy_path() -> Result<()> {
 }
 
 #[tokio::test]
+async fn issue_native_terminal_session_falls_back_to_issued_key() -> Result<()> {
+    let harness = Harness::start().await?;
+    let session = harness.issue_native_terminal_session(false).await?;
+    let native = session.native.context("missing native session bundle")?;
+
+    assert_eq!(native.auth_mode, NativeTerminalAuthMode::IssuedKey);
+    assert_eq!(native.authorized_key_count, 1);
+    assert!(native.private_key_openssh.is_some());
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn public_ssh_happy_path() -> Result<()> {
     let harness = Harness::start().await?;
     let output = harness.public_exec("hostname").await?;
+    assert!(output.contains("exec:hostname"), "{output}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn public_ssh_profile_key_route_happy_path() -> Result<()> {
+    let harness = Harness::start().await?;
+    let output = harness.public_exec_with_profile_key("hostname").await?;
     assert!(output.contains("exec:hostname"), "{output}");
     Ok(())
 }
@@ -120,6 +142,8 @@ struct Harness {
     route_username: String,
     target_username: String,
     target_host_key: String,
+    profile_client_private_key_openssh: String,
+    profile_client_public_key_openssh: String,
     admin_secret: String,
     allowed_origin: String,
     public_host_public: russh::keys::ssh_key::PublicKey,
@@ -147,6 +171,8 @@ impl Harness {
         let public_host_key =
             russh::keys::PrivateKey::random(&mut OsRng, russh::keys::ssh_key::Algorithm::Ed25519)?;
         let public_host_public = public_host_key.public_key().clone();
+        let profile_client_key =
+            russh::keys::PrivateKey::random(&mut OsRng, russh::keys::ssh_key::Algorithm::Ed25519)?;
         let target_key =
             russh::keys::PrivateKey::random(&mut OsRng, russh::keys::ssh_key::Algorithm::Ed25519)?;
         let target_key_path = temp_dir.path().join("target_id");
@@ -224,6 +250,10 @@ impl Harness {
             route_username: "run-01-web".to_owned(),
             target_username: "ubuntu".to_owned(),
             target_host_key: target_host_public,
+            profile_client_private_key_openssh: profile_client_key
+                .to_openssh(russh::keys::ssh_key::LineEnding::LF)?
+                .to_string(),
+            profile_client_public_key_openssh: profile_client_key.public_key().to_openssh()?,
             admin_secret: "admin-secret".to_owned(),
             allowed_origin,
             public_host_public,
@@ -257,12 +287,38 @@ impl Harness {
         &self,
         mode: TerminalSessionMode,
     ) -> Result<IssueTerminalSessionResponse> {
+        self.issue_terminal_session_with_keys(mode, Vec::new())
+            .await
+    }
+
+    async fn issue_native_terminal_session(
+        &self,
+        use_profile_keys: bool,
+    ) -> Result<IssueTerminalSessionResponse> {
+        let authorized_client_public_keys_openssh = if use_profile_keys {
+            vec![self.profile_client_public_key_openssh.clone()]
+        } else {
+            Vec::new()
+        };
+        self.issue_terminal_session_with_keys(
+            TerminalSessionMode::Native,
+            authorized_client_public_keys_openssh,
+        )
+        .await
+    }
+
+    async fn issue_terminal_session_with_keys(
+        &self,
+        mode: TerminalSessionMode,
+        authorized_client_public_keys_openssh: Vec<String>,
+    ) -> Result<IssueTerminalSessionResponse> {
         let request = IssueTerminalSessionRequest {
             route_username: self.route_username.clone(),
             target_username: self.target_username.clone(),
             target_ip: "127.0.0.1".to_owned(),
             target_port: self.target_addr.port(),
             target_host_key_openssh: Some(self.target_host_key.clone()),
+            authorized_client_public_keys_openssh,
             route_expires_at: OffsetDateTime::now_utc() + time::Duration::hours(1),
             mode,
             metadata: RouteMetadata {
@@ -296,22 +352,27 @@ impl Harness {
     }
 
     async fn public_exec(&self, command: &str) -> Result<String> {
-        let session = self
-            .issue_terminal_session(TerminalSessionMode::Native)
-            .await?;
+        let session = self.issue_native_terminal_session(false).await?;
+        let native = session.native.context("missing native bundle")?;
+        self.ssh_exec(native, command).await
+    }
+
+    async fn public_exec_with_profile_key(&self, command: &str) -> Result<String> {
+        let session = self.issue_native_terminal_session(true).await?;
         let native = session.native.context("missing native bundle")?;
         self.ssh_exec(native, command).await
     }
 
     async fn assert_delete_terminates_public_session(&self) -> Result<()> {
-        let session = self
-            .issue_terminal_session(TerminalSessionMode::Native)
-            .await?;
+        let session = self.issue_native_terminal_session(false).await?;
         let native = session.native.context("missing native bundle")?;
 
         let config = client_config(&self.public_host_public);
         let route_key = Arc::new(russh::keys::decode_secret_key(
-            &native.private_key_openssh,
+            native
+                .private_key_openssh
+                .as_deref()
+                .context("missing private key")?,
             None,
         )?);
         let mut ssh_session = russh::client::connect(
@@ -389,10 +450,20 @@ impl Harness {
         command: &str,
     ) -> Result<String> {
         let config = client_config(&self.public_host_public);
-        let route_key = Arc::new(russh::keys::decode_secret_key(
-            &native.private_key_openssh,
-            None,
-        )?);
+        let route_key = if native.auth_mode == NativeTerminalAuthMode::ProfileKeys {
+            Arc::new(russh::keys::decode_secret_key(
+                &self.profile_client_private_key_openssh,
+                None,
+            )?)
+        } else {
+            Arc::new(russh::keys::decode_secret_key(
+                native
+                    .private_key_openssh
+                    .as_deref()
+                    .context("missing private key")?,
+                None,
+            )?)
+        };
         let mut session = russh::client::connect(
             config,
             self.public_ssh_addr,

@@ -1,5 +1,6 @@
 use std::path::Path;
 
+use serde_json::{from_str as json_from_str, to_string as json_to_string};
 use sqlx::{
     Row, SqlitePool, migrate::Migrator, sqlite::SqliteConnectOptions, sqlite::SqlitePoolOptions,
 };
@@ -54,7 +55,7 @@ impl SqliteRouteStore {
                 target_username,
                 target_ip,
                 target_port,
-                native_client_public_key_openssh,
+                authorized_client_public_keys_json,
                 target_host_key_openssh,
                 expires_at,
                 host_id,
@@ -69,10 +70,7 @@ impl SqliteRouteStore {
                 target_username = excluded.target_username,
                 target_ip = excluded.target_ip,
                 target_port = excluded.target_port,
-                native_client_public_key_openssh = COALESCE(
-                    excluded.native_client_public_key_openssh,
-                    routes.native_client_public_key_openssh
-                ),
+                authorized_client_public_keys_json = excluded.authorized_client_public_keys_json,
                 target_host_key_openssh = excluded.target_host_key_openssh,
                 expires_at = excluded.expires_at,
                 host_id = excluded.host_id,
@@ -86,7 +84,7 @@ impl SqliteRouteStore {
         .bind(&route.target_username)
         .bind(&route.target_ip)
         .bind(i64::from(route.target_port))
-        .bind(route.native_client_public_key_openssh.as_deref())
+        .bind(authorized_client_public_keys_json(&route)?)
         .bind(route.target_host_key_openssh.as_deref())
         .bind(route.expires_at.unix_timestamp())
         .bind(route.metadata.host_id.as_deref())
@@ -113,7 +111,7 @@ impl SqliteRouteStore {
                 target_username,
                 target_ip,
                 target_port,
-                native_client_public_key_openssh,
+                authorized_client_public_keys_json,
                 target_host_key_openssh,
                 expires_at,
                 host_id,
@@ -193,7 +191,7 @@ fn row_to_route(row: sqlx::sqlite::SqliteRow) -> Result<RouteRecord> {
         target_username: row.get("target_username"),
         target_ip: row.get("target_ip"),
         target_port,
-        native_client_public_key_openssh: row.get("native_client_public_key_openssh"),
+        authorized_client_public_keys_openssh: authorized_client_public_keys_from_row(&row)?,
         target_host_key_openssh: row.get("target_host_key_openssh"),
         expires_at,
         metadata: stargate_core::RouteMetadata {
@@ -209,4 +207,14 @@ fn row_to_route(row: sqlx::sqlite::SqliteRow) -> Result<RouteRecord> {
 
 fn sqlx_error(error: sqlx::Error) -> StargateError {
     StargateError::Database(error.to_string())
+}
+
+fn authorized_client_public_keys_json(route: &RegisteredRoute) -> Result<String> {
+    json_to_string(&route.authorized_client_public_keys_openssh)
+        .map_err(|error| StargateError::Internal(error.to_string()))
+}
+
+fn authorized_client_public_keys_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<Vec<String>> {
+    let raw = row.get::<String, _>("authorized_client_public_keys_json");
+    json_from_str(&raw).map_err(|error| StargateError::Internal(error.to_string()))
 }
