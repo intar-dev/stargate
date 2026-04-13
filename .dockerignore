@@ -5,8 +5,8 @@
 !/target/release/
 !/target/*/
 /target/release/*
-!/target/release/stargate
 /target/*/*
 !/target/*/release/
 /target/*/release/*
+!/target/release/stargate
 !/target/*/release/stargate
