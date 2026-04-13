@@ -1,0 +1,61 @@
+name: Release
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  CARGO_TARGET_DIR: target
+  IMAGE_NAME: ghcr.io/${{ github.repository }}
+  RUST_TOOLCHAIN: 1.94.0
+
+jobs:
+  publish-container:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+
+      - name: Install Rust
+        run: rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+
+      - name: Build binary
+        run: cargo +"$RUST_TOOLCHAIN" build --release --locked -p stargate
+
+      - name: Compute image tag
+        id: image
+        shell: bash
+        run: |
+          image="$(tr '[:upper:]' '[:lower:]' <<< "$IMAGE_NAME")"
+
+          {
+            echo "tags<<EOF"
+            printf '%s\n' "${image}:${GITHUB_SHA}"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Build image
+        shell: bash
+        run: |
+          tags=()
+          while IFS= read -r tag; do
+            tags+=("-t" "$tag")
+          done <<< "${{ steps.image.outputs.tags }}"
+          docker build "${tags[@]}" .
+
+      - name: Login to GHCR
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: echo "$GITHUB_TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Push image
+        shell: bash
+        run: |
+          while IFS= read -r tag; do
+            docker push "$tag"
+          done <<< "${{ steps.image.outputs.tags }}"
